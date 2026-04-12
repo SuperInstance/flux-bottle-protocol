@@ -7,11 +7,14 @@ Uses only Python stdlib. State is persisted to a JSON ledger file.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -359,8 +362,12 @@ class BottleLedger:
             data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
             for bottle_id, record_data in data.items():
                 self._records[bottle_id] = BottleRecord.from_dict(record_data)
-        except (json.JSONDecodeError, KeyError, ValueError, AttributeError, TypeError):
-            # Corrupted ledger — start fresh
+            logger.debug("Loaded %d bottle records from %s", len(self._records), self.ledger_path)
+        except (json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning(
+                "Corrupted ledger at %s, starting fresh: %s",
+                self.ledger_path, exc,
+            )
             self._records = {}
 
     def _save(self) -> None:
@@ -373,7 +380,10 @@ class BottleLedger:
             bid: rec.to_dict()
             for bid, rec in self._records.items()
         }
-        self.ledger_path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False),
-            encoding="utf-8",
-        )
+        try:
+            self.ledger_path.write_text(
+                json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            logger.error("Failed to save ledger to %s: %s", self.ledger_path, exc)

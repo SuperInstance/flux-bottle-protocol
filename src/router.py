@@ -1,11 +1,12 @@
 """
-Bottle routing logic: target resolution, inbox/outbox paths, scanning.
+Bottle routing logic: target resolution, inbox/outbox paths, scanning, delivery.
 
 Uses only Python stdlib.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -14,9 +15,17 @@ from pathlib import Path
 from typing import List, Optional
 
 try:
-    from .schema import Bottle, BottleType, BottleValidator, Severity
+    from .schema import (
+        Bottle, BottleType, BottleValidator, Priority, Severity,
+        serialize_bottle,
+    )
 except ImportError:
-    from schema import Bottle, BottleType, BottleValidator, Severity
+    from schema import (
+        Bottle, BottleType, BottleValidator, Priority, Severity,
+        serialize_bottle,
+    )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +50,44 @@ class RouteTarget:
     repo: RepoRef
     inbox_path: Path     # full path where the bottle file should be placed
     sender_dir: str      # subdirectory under from-fleet/ (sender agent name)
+
+
+@dataclass
+class DeliveryResult:
+    """Result of a single bottle delivery attempt."""
+
+    target_repo: str
+    target_path: Path
+    success: bool
+    filename: str = ""
+    error: str = ""
+
+    def __str__(self) -> str:
+        if self.success:
+            return f"[OK] {self.target_repo} → {self.target_path / self.filename}"
+        return f"[FAIL] {self.target_repo}: {self.error}"
+
+
+@dataclass
+class ConflictResolution:
+    """Result of a conflict resolution between two bottles claiming the same task."""
+
+    winner: Bottle
+    loser: Bottle
+    reason: str  # e.g. "timestamp_priority", "priority_tiebreaker", "trust_tiebreaker"
+    detail: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Priority retention map (BOTTLE-SPEC.md §9.1)
+# ---------------------------------------------------------------------------
+
+_PRIORITY_RETENTION_DAYS: dict[Priority, int] = {
+    Priority.PRIORITY_CRITICAL: 90,
+    Priority.PRIORITY_HIGH: 30,
+    Priority.PRIORITY_MEDIUM: 30,
+    Priority.PRIORITY_LOW: 30,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +188,64 @@ class BottleRouter:
         return routes
 
     # ------------------------------------------------------------------
+    # Delivery
+    # ------------------------------------------------------------------
+
+    def deliver(
+        self,
+        bottle: Bottle,
+        route_targets: List[RouteTarget] | None = None,
+    ) -> List[DeliveryResult]:
+        """
+        Write serialized bottle file to each target's inbox path.
+
+        Creates the sender subdirectory under from-fleet/ if needed.
+        Uses the canonical filename derived from frontmatter.
+
+        Args:
+            bottle: The Bottle object to deliver.
+            route_targets: Optional pre-resolved targets. If None, resolves
+                           from bottle.frontmatter.to automatically.
+
+        Returns:
+            List of DeliveryResult objects, one per target.
+        """
+        if route_targets is None:
+            route_targets = self.route(bottle)
+
+        content = serialize_bottle(bottle)
+        filename = bottle.filename
+        results: list[DeliveryResult] = []
+
+        for target in route_targets:
+            try:
+                target.inbox_path.mkdir(parents=True, exist_ok=True)
+                dest = target.inbox_path / filename
+                dest.write_text(content, encoding="utf-8")
+                results.append(DeliveryResult(
+                    target_repo=target.repo.name,
+                    target_path=target.inbox_path,
+                    success=True,
+                    filename=filename,
+                ))
+                logger.info(
+                    "Delivered bottle '%s' to %s → %s",
+                    bottle.bottle_id, target.repo.name, dest,
+                )
+            except OSError as exc:
+                error_msg = f"Failed to write to {target.inbox_path}: {exc}"
+                logger.error(error_msg)
+                results.append(DeliveryResult(
+                    target_repo=target.repo.name,
+                    target_path=target.inbox_path,
+                    success=False,
+                    filename=filename,
+                    error=error_msg,
+                ))
+
+        return results
+
+    # ------------------------------------------------------------------
     # Path helpers
     # ------------------------------------------------------------------
 
@@ -195,8 +300,7 @@ class BottleRouter:
                 bottle = validator.parse_bottle(md_file)
                 bottles.append(bottle)
             except (ValueError, FileNotFoundError) as exc:
-                # Skip invalid bottles but could log
-                pass
+                logger.warning("Skipping invalid bottle %s: %s", md_file, exc)
 
         return bottles
 
@@ -259,6 +363,7 @@ class BottleRouter:
 
         existing.add(bottle_filename)
         read_file.write_text("\n".join(sorted(existing)) + "\n", encoding="utf-8")
+        logger.info("Marked bottle '%s' as read in %s", bottle_filename, repo_path)
         return True
 
     # ------------------------------------------------------------------
@@ -307,9 +412,169 @@ class BottleRouter:
                         dest.parent.mkdir(parents=True, exist_ok=True)
                         shutil.move(str(md_file), str(dest))
                         archived.append(md_file.name)
+                        logger.info(
+                            "Archived bottle '%s' (age=%d days) → %s",
+                            md_file.name, age, dest,
+                        )
 
-                except (ValueError, FileNotFoundError):
-                    # Can't parse — skip
-                    pass
+                except (ValueError, FileNotFoundError) as exc:
+                    logger.warning(
+                        "Skipping unparseable file during archival %s: %s",
+                        md_file, exc,
+                    )
 
         return archived
+
+    def archive_by_priority(
+        self,
+        repo_path: str | Path,
+        validator: BottleValidator | None = None,
+    ) -> List[str]:
+        """
+        Priority-aware archival per BOTTLE-SPEC.md §9.1.
+
+        - Critical priority bottles: 90 days retention
+        - High/Medium/Low priority bottles: 30 days retention
+
+        Returns list of archived filenames.
+        """
+        if validator is None:
+            validator = BottleValidator()
+
+        repo = Path(repo_path)
+        bottle_dir = repo / self.BOTTLE_DIR
+        archive = self.get_archive_path(repo)
+        archive.mkdir(parents=True, exist_ok=True)
+
+        now = datetime.now(timezone.utc)
+        archived: list[str] = []
+
+        for sub_dir in [self.OUTBOX, self.INBOX]:
+            source_dir = bottle_dir / sub_dir
+            if not source_dir.exists():
+                continue
+
+            for md_file in sorted(source_dir.rglob("*.md")):
+                try:
+                    bottle = validator.parse_bottle(md_file)
+                    fm = bottle.frontmatter
+                    dt = datetime.fromisoformat(fm.date.replace("Z", "+00:00"))
+                    age = (now - dt).days
+
+                    max_age = _PRIORITY_RETENTION_DAYS.get(
+                        fm.priority, 30,
+                    )
+
+                    if age > max_age:
+                        rel = md_file.relative_to(source_dir)
+                        dest = archive / sub_dir / rel
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(md_file), str(dest))
+                        archived.append(md_file.name)
+                        logger.info(
+                            "Archived bottle '%s' (priority=%s, age=%d days, "
+                            "retention=%d days) → %s",
+                            md_file.name, fm.priority.value, age, max_age, dest,
+                        )
+
+                except (ValueError, FileNotFoundError) as exc:
+                    logger.warning(
+                        "Skipping unparseable file during priority archival %s: %s",
+                        md_file, exc,
+                    )
+
+        return archived
+
+    # ------------------------------------------------------------------
+    # Conflict Resolution (BOTTLE-SPEC.md §10)
+    # ------------------------------------------------------------------
+
+    def resolve_claim_conflict(
+        self,
+        bottle_a: Bottle,
+        bottle_b: Bottle,
+    ) -> ConflictResolution:
+        """
+        Resolve a duplicate task claim between two bottles per §10.1.
+
+        Resolution order:
+          1. Timestamp priority — earlier date wins
+          2. Priority tiebreaker — critical > high > medium > low
+          3. Trust tiebreaker — verified > standard > unverified
+          4. Agent seniority (not implemented — requires external rank data)
+          5. Negotiation — if still tied, suggests RFC_SUBMISSION
+
+        Returns a ConflictResolution with winner/loser/reason.
+        """
+        _PRIORITY_RANK = {
+            Priority.PRIORITY_CRITICAL: 0,
+            Priority.PRIORITY_HIGH: 1,
+            Priority.PRIORITY_MEDIUM: 2,
+            Priority.PRIORITY_LOW: 3,
+        }
+        _TRUST_RANK = {
+            "verified": 0,
+            "standard": 1,
+            "unverified": 2,
+        }
+
+        def _rank(bottle: Bottle) -> tuple:
+            """Build a comparison tuple: (date_str, priority_rank, trust_rank)."""
+            fm = bottle.frontmatter
+            return (
+                fm.date,
+                _PRIORITY_RANK.get(fm.priority, 99),
+                _TRUST_RANK.get(fm.trust_level.value, 99),
+            )
+
+        rank_a = _rank(bottle_a)
+        rank_b = _rank(bottle_b)
+
+        if rank_a < rank_b:
+            winner, loser = bottle_a, bottle_b
+        elif rank_b < rank_a:
+            winner, loser = bottle_b, bottle_a
+        else:
+            # Still tied — suggest negotiation
+            winner, loser = bottle_a, bottle_b
+            logger.warning(
+                "Claim conflict between '%s' and '%s' could not be resolved "
+                "automatically. Consider raising an RFC_SUBMISSION for "
+                "fleet arbitration.",
+                bottle_a.bottle_id, bottle_b.bottle_id,
+            )
+            return ConflictResolution(
+                winner=winner,
+                loser=loser,
+                reason="negotiation_required",
+                detail=(
+                    f"Bottles '{bottle_a.bottle_id}' and '{bottle_b.bottle_id}' "
+                    f"have identical timestamp, priority, and trust level. "
+                    f"Fleet arbitration via RFC_SUBMISSION is recommended."
+                ),
+            )
+
+        # Determine reason
+        reason = "unknown"
+        detail = ""
+        if winner.frontmatter.date != loser.frontmatter.date:
+            reason = "timestamp_priority"
+            detail = f"Winner date '{winner.frontmatter.date}' is earlier than '{loser.frontmatter.date}'."
+        elif winner.frontmatter.priority != loser.frontmatter.priority:
+            reason = "priority_tiebreaker"
+            detail = f"Winner priority '{winner.frontmatter.priority.value}' beats '{loser.frontmatter.priority.value}'."
+        elif winner.frontmatter.trust_level != loser.frontmatter.trust_level:
+            reason = "trust_tiebreaker"
+            detail = f"Winner trust '{winner.frontmatter.trust_level.value}' beats '{loser.frontmatter.trust_level.value}'."
+
+        logger.info(
+            "Resolved claim conflict: winner='%s', loser='%s', reason=%s",
+            winner.bottle_id, loser.bottle_id, reason,
+        )
+
+        return ConflictResolution(
+            winner=winner,
+            loser=loser,
+            reason=reason,
+            detail=detail,
+        )

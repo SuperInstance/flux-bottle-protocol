@@ -30,7 +30,9 @@ from schema import (
     parse_frontmatter,
     serialize_bottle,
 )
-from router import BottleRouter, RepoRef, RouteTarget
+from router import (
+    BottleRouter, RepoRef, RouteTarget, DeliveryResult, ConflictResolution,
+)
 from lifecycle import BottleState, BottleLedger, BottleRecord, StateTransition
 
 
@@ -816,6 +818,399 @@ class TestArchiveCleanup(unittest.TestCase):
             self.assertEqual(len(archived), 0)
         finally:
             shutil.rmtree(repo_path)
+
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+
+
+class TestFilenameValidation(unittest.TestCase):
+    """Tests for filename validation per BOTTLE-SPEC.md §4.2."""
+
+    def setUp(self):
+        self.validator = BottleValidator()
+
+    def test_valid_filename(self):
+        issues = self.validator.validate_filename("CLAIM-Quill-20260412-153000.md")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertEqual(len(errors), 0)
+
+    def test_valid_filename_all_types(self):
+        valid_names = [
+            "INTRODUCTION-Quill-20260412-153000.md",
+            "CLAIM-Cipher-20260412-153000.md",
+            "MESSAGE-Atlas-20260412-153000.md",
+            "RESPONSE-Quill-20260412-153000.md",
+            "STATUS_UPDATE-Cipher-20260412-153000.md",
+            "BROADCAST-Atlas-20260412-153000.md",
+            "RFC_SUBMISSION-Quill-20260412-153000.md",
+            "TASK_COMPLETION-Cipher-20260412-153000.md",
+        ]
+        for name in valid_names:
+            with self.subTest(name=name):
+                issues = self.validator.validate_filename(name)
+                errors = [i for i in issues if i.severity == Severity.ERROR]
+                self.assertEqual(len(errors), 0, f"Unexpected errors for {name}: {errors}")
+
+    def test_missing_md_extension(self):
+        issues = self.validator.validate_filename("CLAIM-Quill-20260412-153000.txt")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(any(".md" in str(i) for i in errors))
+
+    def test_no_extension(self):
+        issues = self.validator.validate_filename("CLAIM-Quill-20260412-153000")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(len(errors) > 0)
+
+    def test_invalid_type_in_filename(self):
+        issues = self.validator.validate_filename("INVALID-Quill-20260412-153000.md")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(any("type" in i.field for i in errors))
+
+    def test_lowercase_type_rejected(self):
+        issues = self.validator.validate_filename("claim-Quill-20260412-153000.md")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(len(errors) > 0)
+
+    def test_invalid_date_in_filename(self):
+        issues = self.validator.validate_filename("CLAIM-Quill-20261345-153000.md")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(any("date" in i.field for i in errors))
+
+    def test_invalid_time_in_filename(self):
+        issues = self.validator.validate_filename("CLAIM-Quill-20260412-256000.md")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(any("time" in i.field for i in errors))
+
+    def test_empty_filename(self):
+        issues = self.validator.validate_filename("")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(len(errors) > 0)
+
+    def test_spaces_in_filename(self):
+        issues = self.validator.validate_filename("CLAIM Quill 20260412 153000.md")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(len(errors) > 0)
+
+    def test_filename_with_special_chars(self):
+        issues = self.validator.validate_filename("CLAIM-Quill!@#-20260412-153000.md")
+        errors = [i for i in issues if i.severity == Severity.ERROR]
+        self.assertTrue(len(errors) > 0)
+
+    def test_bottle_filename_property(self):
+        bottle = make_bottle(
+            from_agent="Quill", to="fleet", bottle_type="CLAIM",
+            subject="Test", body="Body.",
+            date="2026-04-12T15:30:00Z",
+        )
+        self.assertEqual(bottle.filename, "CLAIM-Quill-20260412-153000.md")
+
+    def test_filename_validation_in_full_validate(self):
+        """Filename validation is included when bottle has source_path."""
+        bottle = make_bottle(
+            from_agent="Quill", to="fleet", bottle_type="CLAIM",
+            subject="Test", body="Body.",
+            date="2026-04-12T15:30:00Z",
+        )
+        # Without source_path, no filename validation
+        issues = self.validator.validate(bottle)
+        fn_issues = [i for i in issues if "filename" in i.field]
+        self.assertEqual(len(fn_issues), 0)
+
+        # With source_path, filename is validated
+        bottle.source_path = Path("/tmp/bad-name.txt")
+        issues = self.validator.validate(bottle)
+        fn_issues = [i for i in issues if "filename" in i.field]
+        self.assertTrue(len(fn_issues) > 0)
+
+
+class TestDelivery(unittest.TestCase):
+    """Tests for BottleRouter.deliver() method."""
+
+    def test_deliver_single_target(self):
+        repo_path = _tmp_repo()
+        router = BottleRouter(repos=[
+            RepoRef(name="repo-cipher", agent="Cipher", path=repo_path),
+        ])
+        try:
+            bottle = make_bottle(
+                from_agent="Quill", to="Cipher", bottle_type="MESSAGE",
+                subject="Hello Cipher", body="Hey Cipher!",
+                date="2026-04-12T15:30:00Z",
+            )
+            results = router.deliver(bottle)
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].success)
+
+            # Verify file exists in inbox
+            expected = Path(repo_path) / "message-in-a-bottle" / "from-fleet" / "Quill" / "MESSAGE-Quill-20260412-153000.md"
+            self.assertTrue(expected.exists())
+            content = expected.read_text(encoding="utf-8")
+            self.assertIn("from: Quill", content)
+            self.assertIn("Hey Cipher!", content)
+        finally:
+            shutil.rmtree(repo_path)
+
+    def test_deliver_fleet_wide(self):
+        repo_quill = _tmp_repo()
+        repo_cipher = _tmp_repo()
+        router = BottleRouter(repos=[
+            RepoRef(name="repo-quill", agent="Quill", path=repo_quill),
+            RepoRef(name="repo-cipher", agent="Cipher", path=repo_cipher),
+        ])
+        try:
+            bottle = make_bottle(
+                from_agent="Atlas", to="fleet", bottle_type="BROADCAST",
+                subject="Fleet announcement", body="Hello fleet!",
+                date="2026-04-13T10:00:00Z",
+            )
+            results = router.deliver(bottle)
+            self.assertEqual(len(results), 2)
+            self.assertTrue(all(r.success for r in results))
+
+            # Check both inboxes
+            for repo in [repo_quill, repo_cipher]:
+                expected = Path(repo) / "message-in-a-bottle" / "from-fleet" / "Atlas" / "BROADCAST-Atlas-20260413-100000.md"
+                self.assertTrue(expected.exists(), f"Missing: {expected}")
+        finally:
+            shutil.rmtree(repo_quill)
+            shutil.rmtree(repo_cipher)
+
+    def test_deliver_with_explicit_targets(self):
+        repo_path = _tmp_repo()
+        router = BottleRouter()
+        try:
+            bottle = make_bottle(
+                from_agent="Quill", to="Cipher", bottle_type="MESSAGE",
+                subject="Test", body="Hello.",
+                date="2026-04-12T15:30:00Z",
+            )
+            target = RouteTarget(
+                repo=RepoRef(name="test-repo", agent="Cipher", path=repo_path),
+                inbox_path=Path(repo_path) / "message-in-a-bottle" / "from-fleet" / "Quill",
+                sender_dir="Quill",
+            )
+            results = router.deliver(bottle, route_targets=[target])
+            self.assertEqual(len(results), 1)
+            self.assertTrue(results[0].success)
+            self.assertTrue((Path(repo_path) / "message-in-a-bottle" / "from-fleet" / "Quill" / "MESSAGE-Quill-20260412-153000.md").exists())
+        finally:
+            shutil.rmtree(repo_path)
+
+    def test_deliver_creates_sender_subdirectory(self):
+        repo_path = _tmp_repo()
+        router = BottleRouter(repos=[
+            RepoRef(name="test-repo", agent="Cipher", path=repo_path),
+        ])
+        try:
+            bottle = make_bottle(
+                from_agent="Quill", to="Cipher", bottle_type="MESSAGE",
+                subject="Test", body="Body.",
+                date="2026-04-12T15:30:00Z",
+            )
+            router.deliver(bottle)
+            sender_dir = Path(repo_path) / "message-in-a-bottle" / "from-fleet" / "Quill"
+            self.assertTrue(sender_dir.exists())
+            self.assertTrue(sender_dir.is_dir())
+        finally:
+            shutil.rmtree(repo_path)
+
+    def test_deliver_no_targets(self):
+        router = BottleRouter()  # No repos registered
+        bottle = make_bottle(
+            from_agent="Quill", to="NonExistent", bottle_type="MESSAGE",
+            subject="Test", body="Body.",
+            date="2026-04-12T15:30:00Z",
+        )
+        results = router.deliver(bottle)
+        self.assertEqual(len(results), 0)
+
+
+class TestPriorityArchival(unittest.TestCase):
+    """Tests for priority-aware archival per BOTTLE-SPEC.md §9.1."""
+
+    def test_critical_bottle_90_day_retention(self):
+        repo_path = _tmp_repo()
+        router = BottleRouter()
+        validator = BottleValidator()
+        try:
+            # Critical bottle, 85 days old (should NOT be archived)
+            old_date = (datetime.now(timezone.utc) - timedelta(days=85)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _write_bottle_file(
+                repo_path + "/message-in-a-bottle/for-fleet",
+                "CLAIM-Quill-20260115-120000.md",
+                {
+                    "from": "Quill", "to": "fleet", "type": "CLAIM",
+                    "date": old_date, "subject": "Critical claim",
+                    "priority": "critical",
+                },
+                "This is critical.",
+            )
+            # Medium bottle, 35 days old (should be archived)
+            old_date2 = (datetime.now(timezone.utc) - timedelta(days=35)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _write_bottle_file(
+                repo_path + "/message-in-a-bottle/for-fleet",
+                "MESSAGE-Quill-20260310-120000.md",
+                {
+                    "from": "Quill", "to": "fleet", "type": "MESSAGE",
+                    "date": old_date2, "subject": "Standard message",
+                },
+                "This is standard.",
+            )
+            archived = router.archive_by_priority(repo_path, validator=validator)
+            self.assertEqual(len(archived), 1)
+            self.assertIn("MESSAGE-Quill-20260310-120000", archived[0])
+        finally:
+            shutil.rmtree(repo_path)
+
+    def test_critical_bottle_archived_after_90_days(self):
+        repo_path = _tmp_repo()
+        router = BottleRouter()
+        validator = BottleValidator()
+        try:
+            old_date = (datetime.now(timezone.utc) - timedelta(days=95)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _write_bottle_file(
+                repo_path + "/message-in-a-bottle/for-fleet",
+                "CLAIM-Quill-20260110-120000.md",
+                {
+                    "from": "Quill", "to": "fleet", "type": "CLAIM",
+                    "date": old_date, "subject": "Old critical",
+                    "priority": "critical",
+                },
+                "This is old and critical.",
+            )
+            archived = router.archive_by_priority(repo_path, validator=validator)
+            self.assertEqual(len(archived), 1)
+            self.assertIn("CLAIM-Quill-20260110-120000", archived[0])
+        finally:
+            shutil.rmtree(repo_path)
+
+    def test_priority_archival_empty_repo(self):
+        repo_path = _tmp_repo()
+        router = BottleRouter()
+        validator = BottleValidator()
+        try:
+            archived = router.archive_by_priority(repo_path, validator=validator)
+            self.assertEqual(len(archived), 0)
+        finally:
+            shutil.rmtree(repo_path)
+
+
+class TestConflictResolution(unittest.TestCase):
+    """Tests for conflict resolution per BOTTLE-SPEC.md §10.1."""
+
+    def setUp(self):
+        self.router = BottleRouter()
+
+    def test_earlier_timestamp_wins(self):
+        bottle_a = make_bottle(
+            "Quill", "fleet", "CLAIM", "Task R3",
+            "I claimed first.", date="2026-04-12T10:00:00Z",
+        )
+        bottle_b = make_bottle(
+            "Cipher", "fleet", "CLAIM", "Task R3",
+            "I claimed second.", date="2026-04-12T12:00:00Z",
+        )
+        result = self.router.resolve_claim_conflict(bottle_a, bottle_b)
+        self.assertEqual(result.winner, bottle_a)
+        self.assertEqual(result.reason, "timestamp_priority")
+
+    def test_priority_tiebreaker(self):
+        bottle_a = make_bottle(
+            "Quill", "fleet", "CLAIM", "Task R3",
+            "High priority.", date="2026-04-12T10:00:00Z",
+            priority="high",
+        )
+        bottle_b = make_bottle(
+            "Cipher", "fleet", "CLAIM", "Task R3",
+            "Medium priority.", date="2026-04-12T10:00:00Z",
+            priority="medium",
+        )
+        result = self.router.resolve_claim_conflict(bottle_a, bottle_b)
+        self.assertEqual(result.winner, bottle_a)
+        self.assertEqual(result.reason, "priority_tiebreaker")
+
+    def test_trust_tiebreaker(self):
+        bottle_a = make_bottle(
+            "Quill", "fleet", "CLAIM", "Task R3",
+            "Verified.", date="2026-04-12T10:00:00Z",
+            priority="high", trust_level="verified",
+        )
+        bottle_b = make_bottle(
+            "Cipher", "fleet", "CLAIM", "Task R3",
+            "Standard.", date="2026-04-12T10:00:00Z",
+            priority="high", trust_level="standard",
+        )
+        result = self.router.resolve_claim_conflict(bottle_a, bottle_b)
+        self.assertEqual(result.winner, bottle_a)
+        self.assertEqual(result.reason, "trust_tiebreaker")
+
+    def test_complete_tie_negotiation_required(self):
+        bottle_a = make_bottle(
+            "Quill", "fleet", "CLAIM", "Task R3",
+            "Same as B.", date="2026-04-12T10:00:00Z",
+            priority="high", trust_level="verified",
+        )
+        bottle_b = make_bottle(
+            "Cipher", "fleet", "CLAIM", "Task R3",
+            "Same as A.", date="2026-04-12T10:00:00Z",
+            priority="high", trust_level="verified",
+        )
+        result = self.router.resolve_claim_conflict(bottle_a, bottle_b)
+        self.assertEqual(result.reason, "negotiation_required")
+        self.assertIn("RFC_SUBMISSION", result.detail)
+
+    def test_conflict_result_dataclass(self):
+        bottle_a = make_bottle("Quill", "fleet", "CLAIM", "R3", "A.", date="2026-04-12T10:00:00Z")
+        bottle_b = make_bottle("Cipher", "fleet", "CLAIM", "R3", "B.", date="2026-04-12T12:00:00Z")
+        result = self.router.resolve_claim_conflict(bottle_a, bottle_b)
+        self.assertIsInstance(result, ConflictResolution)
+        self.assertIsInstance(result.detail, str)
+        self.assertTrue(len(result.detail) > 0)
+
+
+class TestLoggingIntegration(unittest.TestCase):
+    """Tests that logging works instead of silent pass."""
+
+    def test_scan_inbox_logs_invalid_files(self):
+        """Invalid files in inbox are logged, not silently ignored."""
+        import logging
+
+        repo_path = _tmp_repo()
+        router = BottleRouter()
+        validator = BottleValidator()
+
+        # Write an invalid file (no frontmatter)
+        bad_file = Path(repo_path) / "message-in-a-bottle" / "from-fleet" / "bad-file.md"
+        bad_file.parent.mkdir(parents=True, exist_ok=True)
+        bad_file.write_text("no frontmatter at all", encoding="utf-8")
+
+        try:
+            with self.assertLogs("router", level="WARNING") as cm:
+                bottles = router.scan_inbox(repo_path, validator)
+            self.assertEqual(len(bottles), 0)
+            self.assertTrue(any("bad-file" in msg for msg in cm.output))
+        finally:
+            shutil.rmtree(repo_path)
+
+    def test_ledger_load_logs_corrupted(self):
+        """Corrupted ledger logs a warning instead of silently resetting."""
+        import logging
+
+        tmpdir = tempfile.mkdtemp()
+        ledger_path = Path(tmpdir) / "message-in-a-bottle" / ".bottle-state" / "ledger.json"
+        ledger_path.parent.mkdir(parents=True)
+        ledger_path.write_text("{invalid json!!!", encoding="utf-8")
+
+        try:
+            with self.assertLogs("lifecycle", level="WARNING") as cm:
+                ledger = BottleLedger(repo_path=tmpdir)
+            self.assertTrue(any("Corrupted" in msg or "corrupted" in msg for msg in cm.output))
+            # Ledger should still be usable (empty)
+            self.assertEqual(len(ledger.get_all_records()), 0)
+        finally:
+            shutil.rmtree(tmpdir)
 
 
 # ---------------------------------------------------------------------------

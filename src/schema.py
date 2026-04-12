@@ -6,6 +6,7 @@ Uses only Python stdlib — YAML frontmatter is parsed with regex.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from dataclasses import dataclass, field
@@ -13,6 +14,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +130,7 @@ class Bottle:
 
     @property
     def bottle_id(self) -> str:
-        """Derive the canonical filename from frontmatter."""
+        """Derive the canonical filename stem from frontmatter."""
         fm = self.frontmatter
         try:
             dt = datetime.fromisoformat(fm.date.replace("Z", "+00:00"))
@@ -135,6 +138,14 @@ class Bottle:
         except (ValueError, AttributeError):
             ts = "unknown"
         return f"{fm.type.value}-{fm.from_agent}-{ts}"
+
+    @property
+    def filename(self) -> str:
+        """Derive the canonical filename (with .md extension) from frontmatter.
+
+        Convention: {TYPE}-{AGENT}-{YYYYMMDD}-{HHMMSS}.md
+        """
+        return f"{self.bottle_id}.md"
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +289,8 @@ class BottleValidator:
         issues: list[ValidationIssue] = []
         issues.extend(self.validate_frontmatter(bottle.frontmatter))
         issues.extend(self.validate_body(bottle.body, bottle.frontmatter.type))
+        if bottle.source_path:
+            issues.extend(self.validate_filename(bottle.source_path.name))
         return issues
 
     def validate_frontmatter(self, fm: BottleFrontmatter) -> list[ValidationIssue]:
@@ -415,6 +428,86 @@ class BottleValidator:
 
         return issues
 
+    def validate_filename(self, filename: str) -> list[ValidationIssue]:
+        """Validate filename matches {TYPE}-{AGENT}-{YYYYMMDD}-{HHMMSS}.md convention.
+
+        Per BOTTLE-SPEC.md §4.2:
+          - TYPE must be one of the 8 defined bottle types (uppercase)
+          - AGENT must be the sending agent's identifier
+          - Timestamp uses UTC, format YYYYMMDD-HHMMSS
+          - Extension is always .md
+          - No spaces, no special characters (beyond hyphens in timestamp)
+        """
+        issues: list[ValidationIssue] = []
+
+        if not filename or not filename.strip():
+            issues.append(ValidationIssue(
+                Severity.ERROR, "filename",
+                "Filename is empty.",
+                "Use format: {TYPE}-{AGENT}-{YYYYMMDD}-{HHMMSS}.md",
+            ))
+            return issues
+
+        # Must end with .md
+        if not filename.endswith(".md"):
+            issues.append(ValidationIssue(
+                Severity.ERROR, "filename",
+                f"Filename '{filename}' does not end with '.md'.",
+                "All bottle files must use .md extension.",
+            ))
+            return issues
+
+        stem = filename[:-3]  # Remove .md
+
+        # Pattern: {TYPE}-{AGENT}-{YYYYMMDD}-{HHMMSS}
+        # TYPE: uppercase letters and underscores
+        # AGENT: alphanumeric, PascalCase recommended
+        # DATE: YYYYMMDD
+        # TIME: HHMMSS
+        pattern = r"^([A-Z_]+)-([A-Za-z0-9_]+)-(\d{8})-(\d{6})$"
+        match = re.match(pattern, stem)
+
+        if not match:
+            issues.append(ValidationIssue(
+                Severity.ERROR, "filename",
+                f"Filename '{filename}' does not match convention {{TYPE}}-{{AGENT}}-{{YYYYMMDD}}-{{HHMMSS}}.md.",
+                "Example: CLAIM-Quill-20260412-153000.md",
+            ))
+            return issues
+
+        type_str, agent, date_str, time_str = match.groups()
+
+        # Validate TYPE
+        valid_types = {t.value for t in BottleType}
+        if type_str not in valid_types:
+            issues.append(ValidationIssue(
+                Severity.ERROR, "filename.type",
+                f"Invalid type '{type_str}' in filename.",
+                f"Valid types: {', '.join(sorted(valid_types))}",
+            ))
+
+        # Validate date components
+        try:
+            datetime.strptime(date_str, "%Y%m%d")
+        except ValueError:
+            issues.append(ValidationIssue(
+                Severity.ERROR, "filename.date",
+                f"Invalid date '{date_str}' in filename.",
+                "Use format YYYYMMDD with a valid date.",
+            ))
+
+        # Validate time components
+        try:
+            datetime.strptime(time_str, "%H%M%S")
+        except ValueError:
+            issues.append(ValidationIssue(
+                Severity.ERROR, "filename.time",
+                f"Invalid time '{time_str}' in filename.",
+                "Use format HHMMSS with a valid time (00-23 for hours, 00-59 for min/sec).",
+            ))
+
+        return issues
+
     def validate_format(self, file_content: str) -> list[ValidationIssue]:
         """Validate raw file content has proper frontmatter + markdown format."""
         issues: list[ValidationIssue] = []
@@ -493,6 +586,7 @@ class BottleValidator:
         errors = [i for i in format_issues if i.severity == Severity.ERROR]
         if errors:
             error_msgs = "\n".join(str(e) for e in errors)
+            logger.warning("Invalid bottle format in %s: %s", path, error_msgs)
             raise ValueError(f"Invalid bottle format:\n{error_msgs}")
 
         fm_data, body = parse_frontmatter(content)
@@ -501,12 +595,18 @@ class BottleValidator:
         fm = self._build_frontmatter(fm_data, path.name)
         bottle = Bottle(frontmatter=fm, body=body.strip(), source_path=path.resolve())
 
-        # Validate and warn (don't raise — consumers can check issues)
+        # Validate including filename
         issues = self.validate(bottle)
         errs = [i for i in issues if i.severity == Severity.ERROR]
         if errs:
             error_msgs = "\n".join(str(e) for e in errs)
+            logger.warning("Validation errors in %s: %s", path, error_msgs)
             raise ValueError(f"Validation errors:\n{error_msgs}")
+
+        # Log any warnings
+        warns = [i for i in issues if i.severity == Severity.WARNING]
+        for w in warns:
+            logger.info("Validation warning in %s: %s", path, w)
 
         return bottle
 
