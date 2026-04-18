@@ -359,7 +359,7 @@ class BottleLedger:
             data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
             for bottle_id, record_data in data.items():
                 self._records[bottle_id] = BottleRecord.from_dict(record_data)
-        except (json.JSONDecodeError, KeyError, ValueError):
+        except (json.JSONDecodeError, KeyError, ValueError, AttributeError, TypeError):
             # Corrupted ledger — start fresh
             self._records = {}
 
